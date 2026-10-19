@@ -1,6 +1,6 @@
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
     import { getAuth, signInAnonymously } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
-    import { getDatabase, ref, get, runTransaction, onValue } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
+    import { getDatabase, ref, get, remove, runTransaction, onValue } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-database.js";
 
     const firebaseConfig = {
       apiKey: "AIzaSyDPSKUIlpu-DXATWSe__zUixRQh41BTJM0",
@@ -22,10 +22,14 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       4: { name: "銀月守衛", effect: "保護自己直到下次抽牌前，其他玩家的卡牌效果對你無效。", copies: 2 },
       5: { name: "月色魔法師", effect: "指定一位玩家（可選自己）棄掉手牌，並從牌堆抽一張新牌。", copies: 2 },
       6: { name: "月光騎士", effect: "與一位玩家交換手牌。", copies: 1 },
-      7: { name: "滿月女王", effect: "抽牌後若手上有 7 號牌且兩張手牌總和至少為 12，先完成出牌再出局。", copies: 1 },
+      7: { name: "滿月女王", effect: "若兩張手牌總和達 12 點或以上，必須打出此牌。", copies: 1 },
       8: { name: "月亮公主", effect: "棄掉此牌時，立即出局。", copies: 1 }
     };
     const cardLabel = rank => `「${cardInfo[rank]?.name || "未知手牌"}」（${rank} 點）`;
+    const forcedSevenIndex = cards =>
+      cards?.length === 2 && cards.includes(7) && cards[0] + cards[1] >= 12
+        ? cards.indexOf(7)
+        : -1;
     const elements = {
       lobby: document.querySelector("#lobby"),
       room: document.querySelector("#room"),
@@ -52,11 +56,13 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
     let selectedGuess = "3";
     let randomTargetSelected = false;
     let leaveConfirmOpen = false;
+    let leaveIntent = "leave";
+    let roomRemovalInProgress = false;
     let modalStep = null;
     let discardDrawerOpen = false;
     let resultQueue = [];
+    let notifiedActionIds = new Set();
     let pendingRoundAward = null;
-    let pendingGameVictory = null;
     let loadedFirstRoomSnapshot = false;
     const notificationPreferenceKey = "moonlit-mail-action-notifications";
     let actionNotificationsEnabled = localStorage.getItem(notificationPreferenceKey) !== "off";
@@ -93,6 +99,12 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       elements.notice.style.display = "none";
     }
 
+    function scrollToPageBottom() {
+      requestAnimationFrame(() => {
+        window.scrollTo({ top: document.documentElement.scrollHeight, behavior: "smooth" });
+      });
+    }
+
     function setBusy(value) {
       busy = value;
       elements.create.disabled = value;
@@ -102,6 +114,21 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
     async function ensureSignedIn() {
       if (!user) user = (await signInAnonymously(auth)).user;
       return user;
+    }
+
+    async function recordGamePageView() {
+      try {
+        await ensureSignedIn();
+        const counterRef = ref(database, "siteStats/gameLinkClicks");
+        const result = await runTransaction(counterRef, count =>
+          typeof count === "number" ? count + 1 : 1
+        );
+        if (!result.committed) {
+          throw new Error("Firebase 沒有提交瀏覽次數。");
+        }
+      } catch (error) {
+        console.error("無法記錄遊戲頁面瀏覽次數：", error);
+      }
     }
 
     function newLobby(uid) {
@@ -125,8 +152,8 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       selectedTarget = "";
       modalStep = null;
       resultQueue = [];
+      notifiedActionIds = new Set();
       pendingRoundAward = null;
-      pendingGameVictory = null;
       loadedFirstRoomSnapshot = false;
       document.body.classList.add("in-room");
       elements.roomCode.textContent = code;
@@ -137,28 +164,35 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         const room = snapshot.val();
         if (!room) {
           leaveRoom();
-          showNotice("這間郵局已不存在，請建立新房間。");
+          if (!roomRemovalInProgress) showNotice("這間郵局已不存在，請建立新房間。");
           return;
         }
+        const shouldScrollToBottom = (currentRoom?.phase === "lobby" && room.phase === "playing") ||
+          (currentRoom?.phase === "roundOver" && room.phase === "playing") ||
+          (currentRoom?.phase === "playing" && ["roundOver", "finished"].includes(room.phase));
         if (room.round) {
           const newRound = room.round.number !== currentRoom?.round?.number;
           let latestActionResult = null;
           const action = room.round.lastAction;
           if (actionNotificationsEnabled && loadedFirstRoomSnapshot && action?.id && action.id !== currentRoom?.round?.lastAction?.id) {
-            latestActionResult = { action, eliminationDetails: "" };
+            latestActionResult = { id: `action:${action.id}`, action, eliminationDetails: "" };
             resultQueue.push(latestActionResult);
+            notifiedActionIds.add(action.id);
           }
           if (actionNotificationsEnabled && room.round.out?.[mySeat] && (newRound || !currentRoom?.round?.out?.[mySeat])) {
+            if (latestActionResult) latestActionResult.viewerEliminated = true;
             const detail = room.round.outDetails?.[mySeat];
             const explanation = detail?.how ? `原因：${detail.how}。` : "";
             const eliminationDetails = detail?.by
               ? detail.how?.startsWith("最終手牌")
-                ? `最終比牌：${playerName(mySeat)} 被 ${detail.by} 比下。${explanation}`
+                ? detail.how
                 : detail.by === playerName(mySeat)
                   ? `你被自己的效果淘汰。${explanation}`
                   : `${detail.by} 淘汰了 ${playerName(mySeat)}。${explanation}`
               : `${playerName(mySeat)} 本輪出局。${explanation}`;
-            if (latestActionResult?.action?.rank === 3 && detail?.how?.startsWith("比牌時手牌較小")) {
+            if (detail?.how?.startsWith("最終手牌")) {
+              latestActionResult && (latestActionResult.eliminationDetails = "");
+            } else if (latestActionResult?.action?.rank === 3 && detail?.how?.startsWith("比牌時手牌較小")) {
               latestActionResult.eliminationDetails = "";
             } else if (latestActionResult) {
               latestActionResult.eliminationDetails = eliminationDetails;
@@ -170,19 +204,25 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
               currentRoom?.round?.number === room.round.number &&
               currentRoom.phase === "playing" &&
               ["roundOver", "finished"].includes(room.phase)) {
-            pendingRoundAward = {
-              id: `round-award:${room.round.number}`,
-              roundAward: true,
-              winnerSeat: room.round.winnerSeats?.[0]
-            };
-            if (room.phase === "finished") {
-              pendingGameVictory = {
-                id: `game-victory:${room.round.number}`,
-                gameVictory: true,
-                winnerSeat: room.winnerSeat
-              };
+            if (actionNotificationsEnabled && action?.id && !notifiedActionIds.has(action.id)) {
+              resultQueue.unshift({ id: `action:${action.id}`, action, eliminationDetails: "" });
+              notifiedActionIds.add(action.id);
             }
-            queuePendingRoundAward();
+            const finalHandResults = room.round.finalHandResults;
+            if (actionNotificationsEnabled && finalHandResults && Object.keys(finalHandResults).length) {
+              resultQueue.push({
+                id: `final-hands:${room.round.number}`,
+                finalHandResults: Object.values(finalHandResults)
+              });
+            }
+            if (actionNotificationsEnabled) {
+              pendingRoundAward = {
+                id: `round-award:${room.round.number}`,
+                roundAward: true,
+                winnerSeat: room.round.winnerSeats?.[0]
+              };
+              queuePendingRoundAward();
+            }
           }
           if (!loadedFirstRoomSnapshot) {
             loadedFirstRoomSnapshot = true;
@@ -191,6 +231,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         }
         currentRoom = room;
         renderRoom(room);
+        if (shouldScrollToBottom) scrollToPageBottom();
         maybePlayAI(room);
       }, error => showNotice(`無法接收房間更新：${error.message}`));
     }
@@ -223,13 +264,14 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
     }
 
     function queuePendingRoundAward() {
+      if (!actionNotificationsEnabled) {
+        pendingRoundAward = null;
+        return;
+      }
       if (resultQueue.length > 0) return;
       if (pendingRoundAward) {
         resultQueue.push(pendingRoundAward);
         pendingRoundAward = null;
-      } else if (pendingGameVictory) {
-        resultQueue.push(pendingGameVictory);
-        pendingGameVictory = null;
       }
     }
 
@@ -281,32 +323,10 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const held = round.hands[seat];
       round.pending = [held, drawn];
       round.hands[seat] = null;
-      round.pendingElimination = null;
       if (round.shields[seat]) {
         round.shields[seat] = false;
         round.log.push(`${playerName(seat)} 的守護在新回合收起。`);
       }
-      if (held === 7 || drawn === 7) {
-        const total = (held || 0) + (drawn || 0);
-        if (total >= 12) {
-          round.pendingElimination = { seat, held, drawn, total };
-          round.log.push(`${playerName(seat)} 抽到 7 號牌與 ${held === 7 ? drawn : held} 點手牌（共 ${total} 點），完成出牌後將出局。`);
-        }
-      }
-    }
-
-    function resolvePendingElimination(room, seat) {
-      const round = room.round;
-      const pending = round.pendingElimination;
-      if (pending?.seat !== seat) return;
-      round.out[seat] = true;
-      round.outDetails ||= {};
-      round.outDetails[seat] = {
-        by: "",
-        how: `抽到 7 號牌與 ${pending.held === 7 ? pending.drawn : pending.held} 點手牌（共 ${pending.total} 點），完成出牌後觸發效果`
-      };
-      round.pendingElimination = null;
-      round.log.push(`${playerName(seat)} 完成出牌後，觸發 7 號牌效果出局。`);
     }
 
     function awardRound(room) {
@@ -318,19 +338,22 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const priority = round.turnOrder.slice(start).concat(round.turnOrder.slice(0, start));
       const winner = priority.find(id => tied.includes(id));
       room.players[winner].tokens = (room.players[winner].tokens || 0) + 1;
-      round.log.push(`${playerName(winner)} 本輪成功送出心意，獲得一枚月光印記。`);
       round.outDetails ||= {};
       for (const loser of remaining) {
         if (loser === winner) continue;
         round.out[loser] = true;
+        const finalHandResult = tied.includes(loser)
+          ? `${playerName(loser)} 最終手牌是${cardLabel(round.hands[loser])}，與 ${playerName(winner)} 最終手牌是${cardLabel(round.hands[winner])} 同點，依回合順序判定勝出。`
+          : `${playerName(loser)} 最終手牌是${cardLabel(round.hands[loser])}，被 ${playerName(winner)} ${cardLabel(round.hands[winner])} 比下去。`;
         round.outDetails[loser] = {
           by: playerName(winner),
-          how: tied.includes(loser)
-            ? `最終手牌是${cardLabel(round.hands[loser])}，與勝者同點，依回合順序判定`
-            : `最終手牌是${cardLabel(round.hands[loser])}，低於勝者的 ${best} 點`
+          how: finalHandResult
         };
-        round.log.push(`${playerName(loser)} 最終手牌是${cardLabel(round.hands[loser])}，被 ${playerName(winner)} 比下去。`);
+        round.finalHandResults ||= {};
+        round.finalHandResults[loser] = finalHandResult;
+        round.log.push(finalHandResult);
       }
+      round.log.push(`恭喜 ${playerName(winner)} 獲得一枚月光印記！✨`);
       round.winnerSeats = [winner];
       round.winningRank = best;
       const champion = playerIds(room).find(id => room.players[id].tokens >= 3);
@@ -739,6 +762,10 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
     async function playSelectedCard() {
       if (!currentRoom || busy || selectedCardIndex == null) return;
       const rank = currentRoom.round.pending[selectedCardIndex];
+      if (forcedSevenIndex(currentRoom.round.pending) !== -1 && rank !== 7) {
+        showNotice("兩張手牌總和達 12 點或以上，必須打出滿月女王。");
+        return;
+      }
       const target = selectedTarget;
       const targetRequired = [1, 2, 3, 5, 6].includes(rank);
       if (targetRequired && !target) {
@@ -759,13 +786,13 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           normalizeRound(room);
           const hand = room.round.pending;
           if (!Array.isArray(hand) || hand.length !== 2 || hand[selectedCardIndex] !== rank) return;
+          if (forcedSevenIndex(hand) !== -1 && rank !== 7) return;
           const kept = hand[1 - selectedCardIndex];
           room.round.discards.push({ seat: mySeat, rank });
           room.round.hands[mySeat] = kept;
           room.round.pending = [];
           logPlayedCard(room.round, mySeat, rank);
           if (!applyCard(room, mySeat, rank, target, selectedGuess)) return;
-          resolvePendingElimination(room, mySeat);
           if (activeIds(room).length <= 1 || room.round.deck.length === 0) {
             awardRound(room);
           } else {
@@ -826,7 +853,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         else {
           resultQueue = [];
           pendingRoundAward = null;
-          pendingGameVictory = null;
+          notifiedActionIds = new Set();
         }
       } catch (error) {
         showNotice(`無法再來一局：${error.message}`);
@@ -844,9 +871,12 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         throw new Error("AI 的待選手牌資料無效，請確認牌局同步後再試。");
       }
       const opponents = activeIds(room).filter(id => id !== seat);
-      const chooseIndex = cards.length === 2
-        ? (cards[0] === 8 ? 1 : cards[1] === 8 ? 0 : cards[0] <= cards[1] ? 0 : 1)
-        : 0;
+      const forcedIndex = forcedSevenIndex(cards);
+      const chooseIndex = forcedIndex !== -1
+        ? forcedIndex
+        : cards.length === 2
+          ? (cards[0] === 8 ? 1 : cards[1] === 8 ? 0 : cards[0] <= cards[1] ? 0 : 1)
+          : 0;
       const rank = cards[chooseIndex];
       let target = opponents[0] || "";
       if (rank === 5) {
@@ -888,7 +918,6 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
             game.round.pending = [];
             logPlayedCard(game.round, seat, choice.rank);
             if (!applyCard(game, seat, choice.rank, choice.target, choice.action)) return;
-            resolvePendingElimination(game, seat);
             if (activeIds(game).length <= 1 || game.round.deck.length === 0) {
               awardRound(game);
             } else {
@@ -992,11 +1021,12 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           </section>
         </div>`;
       }
-      if (result.gameVictory) {
+      if (result.finalHandResults) {
         return `<div class="modal-backdrop" id="action-result-backdrop">
           <section class="modal elimination-modal" role="dialog" aria-modal="true" aria-labelledby="action-result-title">
-            <h3 id="action-result-title">🎉 ${escapeHtml(markOwnPlayerName(playerName(result.winnerSeat)))} 集滿三枚月光印記，成為月夜傳說！</h3>
-            <div class="modal-actions"><button class="button" id="dismiss-round-result">恭喜！</button></div>
+            <h3 id="action-result-title">最終手牌比大小</h3>
+            ${result.finalHandResults.map(message => `<p>${escapeHtml(markOwnPlayerName(message))}</p>`).join("")}
+            <div class="modal-actions"><button class="button" id="dismiss-round-result">繼續</button></div>
           </section>
         </div>`;
       }
@@ -1017,7 +1047,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const messageLines = messages.flatMap(message => message.split("\n"));
       return `<div class="modal-backdrop" id="action-result-backdrop">
         <section class="modal elimination-modal" role="dialog" aria-modal="true" aria-labelledby="action-result-title">
-          <h3 id="action-result-title">${action && result.eliminationDetails ? "出牌與出局結果" : result.eliminationDetails ? "本輪出局" : "出牌結果"}</h3>
+          <h3 id="action-result-title">${action && result.viewerEliminated ? "出局" : result.eliminationDetails ? "本輪出局" : "出牌結果"}</h3>
           ${messageLines.map(message => `<p>${escapeHtml(message)}</p>`).join("")}
           <div class="modal-actions"><button class="button" id="dismiss-round-result">知道了</button></div>
         </section>
@@ -1048,15 +1078,15 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         4: "保護自己，直到下次抽牌前，其他玩家的卡牌效果對你無效。",
         5: `令 ${selectedTarget ? playerName(selectedTarget) : "目標玩家"}（可選自己）棄掉手牌並抽一張新牌。`,
         6: `與 ${selectedTarget ? playerName(selectedTarget) : "目標玩家"} 交換手牌。`,
-        7: "棄掉此牌。若抽牌後手上有 7 號牌且兩張牌總和至少 12，完成出牌後才會出局。",
+        7: "若兩張手牌總和達 12 點或以上，必須打出此牌。",
         8: "棄掉此牌會令你立即出局。"
       }[rank];
       const guessChoices = rank === 1
-        ? `<div class="modal-options">${Object.keys(cardInfo).filter(value => Number(value) >= 2).map(value =>
+        ? `<div class="modal-options guess-options">${Object.keys(cardInfo).filter(value => Number(value) >= 2).map(value =>
             `<button class="modal-option${selectedGuess === value ? " selected" : ""}" data-guess-rank="${value}">${value} · ${cardInfo[value].name}（未出 ${Math.max(0, cardInfo[value].copies - asList(room.round.discards).filter(card => card.rank === Number(value)).length)} 張）</button>`
           ).join("")}</div>`
         : "";
-      return `<div class="modal-backdrop"><section class="modal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+      return `<div class="modal-backdrop"><section class="modal${rank === 1 ? " guess-modal" : ""}" role="dialog" aria-modal="true" aria-labelledby="modal-title">
         <h3 id="modal-title">選擇行動</h3>
         <p>${actionText}</p>
         ${guessChoices}
@@ -1079,7 +1109,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const status = room.phase === "roundOver"
         ? "本輪完成！手牌點數最高的玩家獲得月光印記。"
         : room.phase === "finished"
-          ? `🎉 ${playerName(room.winnerSeat)} 集滿三枚月光印記，成為月夜傳說！`
+          ? "遊戲已結束！"
           : isAI
             ? `${playerName(round.currentSeat)} 正在斟酌要寄出的信…`
             : myTurn ? "輪到你了：選一張牌開始出牌。" : `等待 ${playerName(round.currentSeat)} 寄出下一封信…`;
@@ -1091,13 +1121,15 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const privateMessageMarkup = round.privateMessages?.[mySeat]
         ? `<p class="help">${escapeHtml(round.privateMessages[mySeat])}</p>`
         : "";
+      const forcedSevenCardIndex = forcedSevenIndex(round.pending);
       const handMarkup = myTurn && round.pending?.length === 2
         ? `<section class="hand-area">
           <div class="hand-title"><span>你的手牌</span><span class="private-card">只有你能看得見</span></div>
-          <div class="hand">${round.pending.map((rank, index) => `<button class="playing-card${selectedCardIndex === index ? " selected" : ""}" data-card-index="${index}">
+          <div class="hand">${round.pending.map((rank, index) => `<button class="playing-card${selectedCardIndex === index ? " selected" : ""}" data-card-index="${index}" ${forcedSevenCardIndex !== -1 && index !== forcedSevenCardIndex ? "disabled" : ""}>
             <span class="card-rank">${rank}</span><span class="card-name">${cardInfo[rank].name}</span><span class="card-effect">${cardInfo[rank].effect}</span>
           </button>`).join("")}</div>
           <p class="help" style="margin-top:10px">剛抽到：${cardLabel(round.pending[1])}。</p>
+          ${forcedSevenCardIndex !== -1 ? `<p class="help">兩張手牌總和達 12 點或以上，必須打出滿月女王。</p>` : ""}
           ${viewedHandNote}
           ${privateMessageMarkup}
         </section>`
@@ -1134,8 +1166,11 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         <div class="discard"><strong>遊戲紀錄（可上下捲動）</strong><ul class="log">${log.map(line => `<li>${escapeHtml(markOwnPlayerName(line))}</li>`).join("") || "<li>還沒有信件送出。</li>"}</ul></div>
         ${room.phase === "roundOver" && room.players[mySeat]?.uid === user.uid && room.players[mySeat]?.clientId === clientId ? `<button class="button" id="next-round">開始下一封信</button>` : ""}
         ${room.phase === "finished" ? `<section class="status">
-          <p>恭喜 ${escapeHtml(markOwnPlayerName(playerName(room.winnerSeat)))} 集滿三枚月光印記，成為《月光郵局》的最終勝者！✨</p>
-          <button class="button" id="replay-game" ${busy ? "disabled" : ""}>再來一局</button>
+          <p>遊戲結束！</p>
+          <div class="lobby-controls">
+            <button class="button" id="replay-game" ${busy ? "disabled" : ""}>再來一局</button>
+            ${room.hostUid === user.uid && room.hostClientId === clientId ? `<button class="button light" id="return-lobby">返回大廳</button>` : ""}
+          </div>
         </section>` : ""}
       </div>${renderDiscardDrawer(round)}${renderActionResultModal(resultQueue[0])}${!resultQueue.length && myTurn && selectedCardIndex != null && round.pending?.[selectedCardIndex] != null
         ? renderActionBox(room, round.pending[selectedCardIndex])
@@ -1152,25 +1187,38 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const leaveConfirmation = leaveConfirmOpen
         ? `<div class="modal-backdrop" id="leave-confirm-backdrop">
             <section class="modal elimination-modal" role="dialog" aria-modal="true" aria-labelledby="leave-confirm-title">
-              <h3 id="leave-confirm-title">離開郵局</h3>
-              <p>確定要離開這間郵局嗎？</p>
+              <h3 id="leave-confirm-title">${leaveIntent === "return" ? "返回大廳" : leaveIntent === "disband" ? "解散房間" : "離開房間"}</h3>
+              <p>${leaveIntent === "return" || leaveIntent === "disband"
+                ? "這會刪除整間郵局，所有玩家都會返回各自的大廳。確定繼續嗎？"
+                : "確定要離開這間郵局嗎？"}</p>
               <div class="modal-actions">
                 <button class="button light small" id="cancel-leave">繼續遊戲</button>
-                <button class="button" id="confirm-leave">確認離開</button>
+                <button class="button" id="confirm-leave">${leaveIntent === "return" ? "返回大廳" : leaveIntent === "disband" ? "解散房間" : "確認離開"}</button>
               </div>
             </section>
           </div>`
         : "";
       elements.roomContent.innerHTML = (room.phase === "lobby" ? renderLobby(room) : renderGame(room)) + leaveConfirmation;
+      document.body.classList.toggle("waiting-room", room.phase === "lobby");
+      const isHost = room.hostUid === user.uid && room.hostClientId === clientId;
+      const leaveButton = document.querySelector("#leave-room");
+      leaveButton.textContent = isHost ? "解散房間" : "離開房間";
+      leaveButton.setAttribute("aria-label", isHost ? "解散房間" : "離開房間");
       elements.roomContent.querySelector("#add-ai")?.addEventListener("click", addBot);
       elements.roomContent.querySelector("#start-game")?.addEventListener("click", startGame);
       elements.roomContent.querySelector("#next-round")?.addEventListener("click", nextRound);
       elements.roomContent.querySelector("#replay-game")?.addEventListener("click", replayGame);
-      elements.roomContent.querySelector("#cancel-leave")?.addEventListener("click", () => {
-        leaveConfirmOpen = false;
+      elements.roomContent.querySelector("#return-lobby")?.addEventListener("click", () => {
+        leaveIntent = "return";
+        leaveConfirmOpen = true;
         renderRoom(currentRoom);
       });
-      elements.roomContent.querySelector("#confirm-leave")?.addEventListener("click", leaveRoom);
+      elements.roomContent.querySelector("#cancel-leave")?.addEventListener("click", () => {
+        leaveConfirmOpen = false;
+        leaveIntent = "leave";
+        renderRoom(currentRoom);
+      });
+      elements.roomContent.querySelector("#confirm-leave")?.addEventListener("click", confirmRoomExit);
       elements.roomContent.querySelectorAll("[data-remove-bot]").forEach(button => {
         button.addEventListener("click", () => removeBot(button.dataset.removeBot));
       });
@@ -1193,6 +1241,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           const rank = currentRoom.round.pending[selectedCardIndex];
           modalStep = [1, 2, 3, 5, 6].includes(rank) ? "target" : "action";
           renderRoom(currentRoom);
+          scrollToPageBottom();
         });
       });
       elements.roomContent.querySelectorAll("[data-target-seat]").forEach(button => {
@@ -1204,6 +1253,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           }
           modalStep = "action";
           renderRoom(currentRoom);
+          scrollToPageBottom();
         });
       });
       elements.roomContent.querySelector("#random-target")?.addEventListener("click", () => {
@@ -1217,6 +1267,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           if (rank === 1) selectedGuess = "";
           modalStep = "action";
           renderRoom(currentRoom);
+          scrollToPageBottom();
         } else {
           target.click();
         }
@@ -1239,6 +1290,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         selectedGuess = "3";
         modalStep = [1, 2, 3, 5, 6].includes(currentRoom.round.pending[selectedCardIndex]) ? "target" : "action";
         renderRoom(currentRoom);
+        scrollToPageBottom();
       });
       elements.roomContent.querySelector("#play-card")?.addEventListener("click", playSelectedCard);
       const dismissRoundResult = () => {
@@ -1255,6 +1307,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
             queuePendingRoundAward();
           } else if (event.currentTarget.id === "leave-confirm-backdrop") {
             leaveConfirmOpen = false;
+            leaveIntent = "leave";
           } else {
             selectedCardIndex = null;
             selectedTarget = "";
@@ -1278,11 +1331,38 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       mySeat = null;
       randomTargetSelected = false;
       leaveConfirmOpen = false;
+      leaveIntent = "leave";
       maybePlayAI.lastKey = null;
       document.body.classList.remove("in-room");
       elements.room.classList.add("hidden");
       elements.lobby.classList.remove("hidden");
       elements.roomContent.replaceChildren();
+    }
+
+    async function confirmRoomExit() {
+      if (!currentRoom || !roomRef) return;
+      const removingRoom = leaveIntent !== "leave";
+      const isHost = currentRoom.hostUid === user.uid && currentRoom.hostClientId === clientId;
+      if (removingRoom && !isHost) {
+        showNotice("只有房主可以解散房間或返回大廳。");
+        return;
+      }
+      if (!removingRoom) {
+        leaveRoom();
+        return;
+      }
+      const targetRef = roomRef;
+      const confirmedIntent = leaveIntent;
+      roomRemovalInProgress = true;
+      try {
+        await remove(targetRef);
+        leaveRoom();
+        showNotice(confirmedIntent === "return" ? "房間已刪除，你已返回大廳。" : "房間已解散，所有玩家已返回大廳。", true);
+      } catch (error) {
+        showNotice(`無法刪除房間：${error.message}`);
+      } finally {
+        roomRemovalInProgress = false;
+      }
     }
 
     async function copyCode() {
@@ -1307,15 +1387,22 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       elements.notificationToggle.title = `彈出通知${actionNotificationsEnabled ? "開啟" : "關閉"}，點擊切換`;
     };
     syncNotificationToggle();
+    recordGamePageView();
     elements.notificationToggle.addEventListener("click", () => {
       actionNotificationsEnabled = !actionNotificationsEnabled;
       localStorage.setItem(notificationPreferenceKey, actionNotificationsEnabled ? "on" : "off");
-      if (!actionNotificationsEnabled) resultQueue = [];
+      if (!actionNotificationsEnabled) {
+        resultQueue = [];
+        pendingRoundAward = null;
+      }
       queuePendingRoundAward();
       syncNotificationToggle();
       if (currentRoom) renderRoom(currentRoom);
     });
     document.querySelector("#leave-room").addEventListener("click", () => {
+      leaveIntent = currentRoom?.hostUid === user.uid && currentRoom?.hostClientId === clientId
+        ? "disband"
+        : "leave";
       leaveConfirmOpen = true;
       renderRoom(currentRoom);
     });

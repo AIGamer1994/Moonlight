@@ -34,17 +34,26 @@
 ```json
 {
   "rules": {
-    "rooms": {
+    "moonlightrooms": {
       "$roomId": {
         ".read": "auth != null",
         ".write": "auth != null"
+      }
+    },
+    "siteStats": {
+      "gameLinkClicks": {
+        ".read": "auth != null",
+        ".write": "auth != null && newData.isNumber() && ((!data.exists() && newData.val() == 1) || (data.exists() && newData.val() == data.val() + 1))",
+        ".validate": "newData.isNumber()"
       }
     }
   }
 }
 ```
 
-如果你的 `/rooms/$roomId` 規則尚未允許已登入玩家讀寫，請依照上一個過三關專案的 Firebase 設定補上。Firebase Console 還需啟用 **Authentication → Sign-in method → Anonymous**，並建立 **Realtime Database**。
+`siteStats/gameLinkClicks` 會累計遊戲頁面載入次數。發布前請在 Firebase Console → **Realtime Database → Rules** 將 `siteStats` 規則合併到現有規則中，不要移除或覆蓋其他專案原有規則。第一次載入時，計數器會建立為 `1`；之後每次頁面載入加 `1`。在 **Realtime Database → Data** 的 `siteStats/gameLinkClicks` 查看數字。
+
+如果你的 `/rooms/$roomId` 規則尚未允許已登入玩家讀寫，請依照上一個過三關專案的 Firebase 設定補上。Firebase Console 還需啟用 **Authentication → Sign-in method → Anonymous**，並建立 **Realtime Database**。此計數器記錄頁面載入，不會辨認真人或阻止訪客重複載入；前端計數不適合作為防作弊或正式流量分析。
 
 以上規則適合原型測試：任何已匿名登入的玩家都可讀寫房間資料。不要把這個資料庫規則當作正式服務的防作弊安全機制。
 
