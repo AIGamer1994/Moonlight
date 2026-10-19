@@ -121,7 +121,9 @@
     .guess-modal .modal-actions { position: sticky; bottom: -16px; z-index: 1; margin: auto -4px -4px; padding: 10px 4px 4px; background: #171f3e; }
     .guess-modal #modal-back { width: 100%; min-height: 40px; }
     .modal-option { min-height: 43px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; background: #202949; color: inherit; text-align: left; }
-    .modal-option:hover { border-color: var(--berry); background: #2b365d; }
+    @media (hover: hover) and (pointer: fine) {
+      .modal-option:hover { border-color: var(--berry); background: #2b365d; }
+    }
     .random-target { width: 100%; margin-top: 8px; text-align: center; }
     .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 17px; }
     .modal-actions .button { font-size: .88rem; }

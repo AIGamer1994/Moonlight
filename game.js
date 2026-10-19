@@ -182,15 +182,16 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
           if (actionNotificationsEnabled && room.round.out?.[mySeat] && (newRound || !currentRoom?.round?.out?.[mySeat])) {
             if (latestActionResult) latestActionResult.viewerEliminated = true;
             const detail = room.round.outDetails?.[mySeat];
+            const isFinalHandElimination = detail?.how?.includes(" 最終手牌是");
             const explanation = detail?.how ? `原因：${detail.how}。` : "";
             const eliminationDetails = detail?.by
-              ? detail.how?.startsWith("最終手牌")
+              ? isFinalHandElimination
                 ? detail.how
                 : detail.by === playerName(mySeat)
                   ? `你被自己的效果淘汰。${explanation}`
                   : `${detail.by} 淘汰了 ${playerName(mySeat)}。${explanation}`
               : `${playerName(mySeat)} 本輪出局。${explanation}`;
-            if (detail?.how?.startsWith("最終手牌")) {
+            if (isFinalHandElimination) {
               latestActionResult && (latestActionResult.eliminationDetails = "");
             } else if (latestActionResult?.action?.rank === 3 && detail?.how?.startsWith("比牌時手牌較小")) {
               latestActionResult.eliminationDetails = "";
@@ -715,8 +716,15 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         publicText = targetLog.includes("守護擋下了決鬥")
           ? `${actor} 打出 ${cardLabel(3)}，${targetName} 的守護擋下決鬥，沒有進行比牌。`
           : own === theirs
-            ? `${actor} 打出 ${cardLabel(3)}與 ${targetName} 比牌。\n${handsCompared}。\n平手，無人淘汰。`
-            : `${actor} 打出 ${cardLabel(3)}與 ${targetName} 比牌。\n${handsCompared}。\n${playerName(eliminated === seat ? target : seat)} 淘汰了 ${playerName(eliminated)}。`;
+            ? `${actor} 打出 ${cardLabel(3)}與 ${targetName} 比牌，平手，無人淘汰。`
+            : `${actor} 打出 ${cardLabel(3)}與 ${targetName} 比牌，${playerName(eliminated)} 的手牌是${cardLabel(round.hands[eliminated])}，${playerName(eliminated === seat ? target : seat)} 淘汰了 ${playerName(eliminated)}。`;
+        if (!targetLog.includes("守護擋下了決鬥")) {
+          const privateComparison = own === theirs
+            ? `${actor} 與 ${targetName} 比牌。\n${handsCompared}。\n平手，無人淘汰。`
+            : `${actor} 與 ${targetName} 比牌。\n${handsCompared}。\n${playerName(eliminated === seat ? target : seat)} 淘汰了 ${playerName(eliminated)}。`;
+          privateTexts[seat] = privateComparison;
+          privateTexts[target] = privateComparison;
+        }
       } else if (rank === 4) {
         publicText = `${actor} 打出 ${cardLabel(4)}，受到保護直到下次抽牌。`;
       } else if (rank === 5) {
@@ -1165,13 +1173,6 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         ${handMarkup}
         <div class="discard"><strong>遊戲紀錄（可上下捲動）</strong><ul class="log">${log.map(line => `<li>${escapeHtml(markOwnPlayerName(line))}</li>`).join("") || "<li>還沒有信件送出。</li>"}</ul></div>
         ${room.phase === "roundOver" && room.players[mySeat]?.uid === user.uid && room.players[mySeat]?.clientId === clientId ? `<button class="button" id="next-round">開始下一封信</button>` : ""}
-        ${room.phase === "finished" ? `<section class="status">
-          <p>遊戲結束！</p>
-          <div class="lobby-controls">
-            <button class="button" id="replay-game" ${busy ? "disabled" : ""}>再來一局</button>
-            ${room.hostUid === user.uid && room.hostClientId === clientId ? `<button class="button light" id="return-lobby">返回大廳</button>` : ""}
-          </div>
-        </section>` : ""}
       </div>${renderDiscardDrawer(round)}${renderActionResultModal(resultQueue[0])}${!resultQueue.length && myTurn && selectedCardIndex != null && round.pending?.[selectedCardIndex] != null
         ? renderActionBox(room, round.pending[selectedCardIndex])
         : ""}`;
