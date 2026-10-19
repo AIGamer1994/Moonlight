@@ -1117,7 +1117,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
       const status = room.phase === "roundOver"
         ? "本輪完成！手牌點數最高的玩家獲得月光印記。"
         : room.phase === "finished"
-          ? "遊戲已結束！"
+          ? `🎉 恭喜 ${markOwnPlayerName(playerName(room.winnerSeat))} 成為月夜傳說！🌙`
           : isAI
             ? `${playerName(round.currentSeat)} 正在斟酌要寄出的信…`
             : myTurn ? "輪到你了：選一張牌開始出牌。" : `等待 ${playerName(round.currentSeat)} 寄出下一封信…`;
@@ -1173,6 +1173,7 @@ import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.5/fireba
         ${handMarkup}
         <div class="discard"><strong>遊戲紀錄（可上下捲動）</strong><ul class="log">${log.map(line => `<li>${escapeHtml(markOwnPlayerName(line))}</li>`).join("") || "<li>還沒有信件送出。</li>"}</ul></div>
         ${room.phase === "roundOver" && room.players[mySeat]?.uid === user.uid && room.players[mySeat]?.clientId === clientId ? `<button class="button" id="next-round">開始下一封信</button>` : ""}
+        ${room.phase === "finished" ? `<button class="button" id="replay-game" ${busy ? "disabled" : ""}>再來一局</button>` : ""}
       </div>${renderDiscardDrawer(round)}${renderActionResultModal(resultQueue[0])}${!resultQueue.length && myTurn && selectedCardIndex != null && round.pending?.[selectedCardIndex] != null
         ? renderActionBox(room, round.pending[selectedCardIndex])
         : ""}`;
